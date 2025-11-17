@@ -15,6 +15,9 @@ import json
 APP_DIR = Path.home() / "Codec Converter"
 APP_DIR.mkdir(exist_ok=True)
 SETTINGS_FILE = APP_DIR / "settings.json"
+this_script_dir = os.path.dirname(os.path.abspath(__file__))
+ffmpeg_bin = os.path.join(this_script_dir, 'ffmpeg', 'bin')
+os.environ['PATH'] += os.pathsep + ffmpeg_bin
 
 
 def load_json(path: Path, default):
