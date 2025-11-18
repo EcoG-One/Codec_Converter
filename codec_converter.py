@@ -1,13 +1,13 @@
 import os
 import ffmpeg
-from ffcuesplitter.cuesplitter import FFCueSplitter
+# from ffcuesplitter.cuesplitter import FFCueSplitter
 # from ffcuesplitter.user_service import FileSystemOperations
 import sys
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtCore import QThread, Signal, QMutex, Slot
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QWizard, QWizardPage, QLabel, QCheckBox, QPushButton,
     QToolBar, QTextEdit, QFileDialog, QLineEdit, QDialog, QFormLayout, QDialogButtonBox, QMessageBox)
-from formats import ffmpeg_formats
+from formats import all_codecs
 from pathlib import Path
 import json
 
@@ -46,14 +46,14 @@ def get_settings():
     return json_settings
 
 
-def cue_spliter(cue_file: str, output_dir: str = '.', dry_run: bool = False):
+'''def cue_spliter(cue_file: str, output_dir: str = '.', dry_run: bool = False):
     splitter = FFCueSplitter(cue_file, output_dir, dry=dry_run)
     if dry_run:
         splitter.dry_run_mode()
     else:
         overwrite = splitter.check_for_overwriting()
         if not overwrite:
-            splitter.work_on_temporary_directory()
+            splitter.work_on_temporary_directory()'''
 
 
 
@@ -249,6 +249,14 @@ class AppWindow(QMainWindow):
                     output = file.replace(f_codec, t_codec)
                     try:
                         (ffmpeg.input(file).output(output).run())
+                        """(ffmpeg.input(file, hwaccel='qsv',vcodec='h264_qsv')        #This tells FFmpeg to use Intel Arc's hardware decoder for AVC.
+                                  .output(output,
+                                                vcodec='hevc_qsv',
+                                                global_quality=22,     # quality (like CRF for QSV 18 to 26)
+                                                video_bitrate='10M',   # optional:
+                                                maxrate='10M',         # optional:
+                                                bufsize='20M',         # optional:
+                                                preset='slow').run())  # optional: 'medium', 'fast', 'faster', etc."""
                         self.worker_messages.emit(f"File {output} created.")
                     except FileNotFoundError as e:
                         self.work_error.emit("File not found. " + str(e))
@@ -270,10 +278,12 @@ class AppWindow(QMainWindow):
         # Show the dialog modally and wait for user interaction
         if from_to_input.exec():
             # exec() returns QDialog.Accepted (1) if OK was clicked
-            self.valid_elements_lower = {item.lower() for item in
-                                         ffmpeg_formats}
+            self.valid_demuxers_lower = {item.lower() for item in
+                                         all_codecs}
+            self.valid_muxers_lower = {item.lower() for item in
+                                         all_codecs}
             self.c_from, self.c_to, self.del_files = from_to_input.get_inputs()
-            if self.c_from.lower() in self.valid_elements_lower and self.c_to.lower() in self.valid_elements_lower:
+            if self.c_from.lower() in self.valid_demuxers_lower and self.c_to.lower() in self.valid_muxers_lower:
                 if self.del_files:
                     no = ''
                 else:
@@ -288,7 +298,7 @@ class AppWindow(QMainWindow):
                     self.editor.append("Please select <b>directory</b> to proceed.")
 
             else:
-                if self.c_from.lower() not in ffmpeg_formats:
+                if self.c_from.lower() not in all_codecs:
                     QMessageBox.critical(self, 'Oops',
                                          f'{self.c_from} is not a valid format')
                 else:
@@ -394,13 +404,13 @@ class LocalMetaWorker(QThread):
     work_completed = Signal(str)   # Emits {'retrieved_metadata': metadata}
     work_error = Signal(str)
 
-    def __init__(self, c_from, c_to, selected_directory, del_files, callable):
+    def __init__(self, c_from, c_to, selected_directory, del_files, worker_callable):
         super().__init__()
         self.c_from = c_from
         self.c_to = c_to
         self.selected_directory = selected_directory
         self.del_files = del_files
-        self.callable = callable
+        self.callable = worker_callable
         self.mutex = QMutex()
 
     def run(self):
@@ -455,20 +465,27 @@ class CodecsWizardPage(QWizardPage):
         self.from_line_edit.textChanged.connect(self.update_status_labels)
         self.to_line_edit.textChanged.connect(self.update_status_labels)
 
-    def is_valid_format(self, input_text):
+    def is_valid_from(self, input_text):
         """Helper to check if a single format is valid (case-insensitive)."""
         input_text_lower = input_text.strip().lower()
         # Pre-calculate the lowercase set once
-        valid_elements_lower = {item.lower() for item in ffmpeg_formats}
-        return input_text_lower in valid_elements_lower
+        valid_demuxers_lower = {item.lower() for item in all_codecs}
+        return input_text_lower in valid_demuxers_lower
+
+    def is_valid_to(self, input_text):
+        """Helper to check if a single format is valid (case-insensitive)."""
+        input_text_lower = input_text.strip().lower()
+        # Pre-calculate the lowercase set once
+        valid_muxers_lower = {item.lower() for item in all_codecs}
+        return input_text_lower in valid_muxers_lower
 
     def update_status_labels(self):
         """Updates the status label for live feedback."""
         from_text = self.from_line_edit.text().strip()
         to_text = self.to_line_edit.text().strip()
 
-        is_from_valid = self.is_valid_format(from_text)
-        is_to_valid = self.is_valid_format(to_text)
+        is_from_valid = self.is_valid_from(from_text)
+        is_to_valid = self.is_valid_to(to_text)
 
         if is_from_valid and is_to_valid:
             self.status_label.setText("Status: **Both formats are valid** ✅")
@@ -492,7 +509,7 @@ class CodecsWizardPage(QWizardPage):
         from_text = self.from_line_edit.text().strip()
         to_text = self.to_line_edit.text().strip()
 
-        return self.is_valid_format(from_text) and self.is_valid_format(
+        return self.is_valid_from(from_text) and self.is_valid_to(
             to_text)
 
     def validatePage(self):
