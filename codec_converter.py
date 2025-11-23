@@ -1,7 +1,7 @@
 import os
 import ffmpeg
-# from ffcuesplitter.cuesplitter import FFCueSplitter
-# from ffcuesplitter.user_service import FileSystemOperations
+from ffcuesplitter.cuesplitter import FFCueSplitter
+from ffcuesplitter.user_service import FileSystemOperations
 import sys
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtCore import QThread, Signal, QMutex, Slot
@@ -46,14 +46,15 @@ def get_settings():
     return json_settings
 
 
-'''def cue_spliter(cue_file: str, output_dir: str = '.', dry_run: bool = False):
-    splitter = FFCueSplitter(cue_file, output_dir, dry=dry_run)
+def cue_spliter(cue_file):
+    splitter = FileSystemOperations(filename=cue_file)
+    dry_run = False
     if dry_run:
         splitter.dry_run_mode()
     else:
         overwrite = splitter.check_for_overwriting()
         if not overwrite:
-            splitter.work_on_temporary_directory()'''
+            splitter.work_on_temporary_directory()
 
 
 
@@ -161,21 +162,18 @@ class AppWindow(QMainWindow):
         go_action = QAction(QIcon("icons/go.png"), "Go", self)
         go_action.setShortcut("Ctrl+G")
         go_action.triggered.connect(self.ready)
+        split_action = QAction(QIcon("icons/splitter.png"), "Go", self)
+        split_action.setShortcut("Ctrl+P")
+        split_action.triggered.connect(self.split)
         quit_action = QAction(QIcon("icons/power.png"),"Quit", self)
         quit_action.setShortcut("Ctrl+Q")
 
-        '''copy_action = QAction(QIcon("icons/copy.png"), "Copy", self)
-        copy_action.setShortcut('Ctrl+C')
-        cut_action = QAction(QIcon("icons/cut.png"), "Cut", self)
-        cut_action.setShortcut("Ctrl+X")
-        paste_action = QAction(QIcon("icons/paste.png"), "Paste", self)
-        paste_action.setShortcut("Ctrl+V")
-'''
         # Add action to toolbar
         toolbar.addAction(wiz_action)
         toolbar.addAction(set_action)
         toolbar.addAction(open_action)
         toolbar.addAction(go_action)
+        toolbar.addAction(split_action)
 
         # Create menu items
         wizard_menu = menubar.addMenu('Wizard')
@@ -188,13 +186,12 @@ class AppWindow(QMainWindow):
         file_menu.addAction(go_action)
         file_menu.addAction(quit_action)
 
-        ''' # Edit menu
-        edit_menu = menubar.addMenu('Edit')
+        # Split menu
+        split_menu = menubar.addMenu('Split')
 
-        edit_menu.addAction(copy_action)
-        edit_menu.addAction(cut_action)
-        edit_menu.addAction(paste_action)
-'''
+        split_menu.addAction(split_action)
+
+
 
         # Layouts
         main_layout = QVBoxLayout(c_widget)
@@ -309,7 +306,11 @@ class AppWindow(QMainWindow):
             # exec() returns QDialog.Rejected (0) if Cancel was clicked
             self.editor.append("User cancelled the dialog.")
 
-
+    def split(self):
+        cue_file = QFileDialog.getOpenFileNames(self, "Select a cue file to split",
+                                            "",
+                                            "Cue files (*.cue)")[0][0]
+        cue_spliter(cue_file)
 
     def start_wizard(self):
         wizard = ConvertWizard(self)
