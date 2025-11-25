@@ -1,12 +1,16 @@
 import os
 import ffmpeg
-from ffcuesplitter.cuesplitter import FFCueSplitter
+import logging
+import os.path
+from subprocess import CompletedProcess, CalledProcessError, run
 from ffcuesplitter.user_service import FileSystemOperations
+from ffcuesplitter.exceptions import FFMpegError
 import sys
-from PySide6.QtGui import QIcon, QAction
-from PySide6.QtCore import QThread, Signal, QMutex, Slot
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QWizard, QWizardPage, QLabel, QCheckBox, QPushButton,
-    QToolBar, QTextEdit, QFileDialog, QLineEdit, QDialog, QFormLayout, QDialogButtonBox, QMessageBox)
+from PySide6.QtGui import QIcon, QAction, QTextCursor, QCloseEvent
+from PySide6.QtCore import QThread, Signal, QMutex, QObject, Slot
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+     QWizard, QWizardPage, QLabel, QCheckBox, QPushButton, QToolBar, QTextEdit,
+     QFileDialog, QLineEdit, QDialog, QFormLayout, QDialogButtonBox, QMessageBox)
 from formats import all_codecs
 from pathlib import Path
 import json
@@ -18,7 +22,10 @@ SETTINGS_FILE = APP_DIR / "settings.json"
 this_script_dir = os.path.dirname(os.path.abspath(__file__))
 ffmpeg_bin = os.path.join(this_script_dir, 'ffmpeg', 'bin')
 os.environ['PATH'] += os.pathsep + ffmpeg_bin
+selected_directory = None
 
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
 
 def load_json(path: Path, default):
     try:
@@ -46,18 +53,6 @@ def get_settings():
     return json_settings
 
 
-def cue_spliter(cue_file):
-    splitter = FileSystemOperations(filename=cue_file)
-    dry_run = False
-    if dry_run:
-        splitter.dry_run_mode()
-    else:
-        overwrite = splitter.check_for_overwriting()
-        if not overwrite:
-            splitter.work_on_temporary_directory()
-
-
-
 def select_directory_dialog():
     global selected_directory
     selected_directory = None
@@ -79,6 +74,62 @@ def select_directory_dialog():
         except NameError:
             pass
     return selected_directory
+
+
+def cue_spliter(cue_file, del_orig_files):
+    splitter = FileSystemOperations(filename=cue_file,
+                                    del_orig_files=del_orig_files)
+    overwrite = splitter.check_for_overwriting()
+    if not overwrite:
+        try:
+            splitter.work_on_temporary_directory()
+        except CalledProcessError as err:
+            window.editor.append(f"Splitting cue file {cue_file} failed with {err}")
+            raise FFMpegError(
+                f"Splitting cue {cue_file} failed with {err}") from err
+        except FileNotFoundError as err:
+            window.editor.append(
+                f"Splitting cue file {cue_file} failed with {err}")
+            raise FFMpegError(
+                f"Splitting cue {cue_file} failed with {err}") from err
+        except KeyboardInterrupt as err:
+            msg = "[KeyboardInterrupt] process failed."
+            window.editor.append(msg)
+            raise FFMpegError(msg) from err
+
+
+
+def remove_original_audio_file(cue_file_path: str) -> None:
+    """
+    Delete original audiofile.
+    There is a precondition that the name of the file matches the name
+    of the CUE file.
+    """
+    original_audio_file = get_original_audio_file(cue_file_path)
+    if original_audio_file:
+        try:
+            os.remove(original_audio_file)
+            logger.info(f"Deleted original audiofile {original_audio_file}")
+        except OSError as e:
+            logger.error(
+                f"Error deleting original audiofile {original_audio_file}: {e}")
+
+
+def get_original_audio_file(cue_file_path: str) -> str:
+    """
+    Get the original audio file.
+    """
+    extensions = [".flac", ".ape", ".wav", ".mp3", ".ogg", ".opus"]
+
+    file_without_ext = os.path.splitext(cue_file_path)[0]
+    file_with_ext = None
+    for ext in extensions:
+        file_with_ext = file_without_ext + ext
+        if os.path.exists(file_with_ext):
+            return file_with_ext
+        else:
+            continue
+
 
 
 class TwoInputCustomDialog(QDialog):
@@ -103,7 +154,8 @@ class TwoInputCustomDialog(QDialog):
 
         form_layout.addRow("From:", self.input1_field)
         form_layout.addRow("To:", self.input2_field)
-        form_layout.addRow('Delete original files after conversion', self.delete_files)
+        form_layout.addRow('Delete original files after conversion',
+                           self.delete_files)
 
         main_layout.addLayout(form_layout)
 
@@ -119,13 +171,20 @@ class TwoInputCustomDialog(QDialog):
 
     def get_inputs(self):
         """Method to retrieve the text values."""
-        return self.input1_field.text(), self.input2_field.text(), self.delete_files.isChecked()
+        return (self.input1_field.text(), self.input2_field.text(),
+                self.delete_files.isChecked())
 
+class EmittingStream(QObject):
+    text_written = Signal(str)
+
+    def write(self, text):
+        self.text_written.emit(str(text))
 
 
 class AppWindow(QMainWindow):
     work_error = Signal(str)
     worker_messages = Signal(str)
+
     def __init__(self, settings):
         super().__init__()
         self.worker = None
@@ -162,24 +221,25 @@ class AppWindow(QMainWindow):
         go_action = QAction(QIcon("icons/go.png"), "Go", self)
         go_action.setShortcut("Ctrl+G")
         go_action.triggered.connect(self.ready)
-        split_action = QAction(QIcon("icons/splitter.png"), "Go", self)
-        split_action.setShortcut("Ctrl+P")
+        split_action = QAction(QIcon("icons/cue2.png"), "Split One", self)
+        split_action.setShortcut("Ctrl+O")
         split_action.triggered.connect(self.split)
+        split_all_action = QAction(QIcon("icons/cue.png"), "Split All", self)
+        split_all_action.setShortcut("Ctrl+A")
+        split_all_action.triggered.connect(self.split_all)
         quit_action = QAction(QIcon("icons/power.png"),"Quit", self)
         quit_action.setShortcut("Ctrl+Q")
 
         # Add action to toolbar
-        toolbar.addAction(wiz_action)
         toolbar.addAction(set_action)
         toolbar.addAction(open_action)
         toolbar.addAction(go_action)
         toolbar.addAction(split_action)
+        toolbar.addAction(split_all_action)
+        toolbar.addAction(wiz_action)
 
         # Create menu items
-        wizard_menu = menubar.addMenu('Wizard')
-        wizard_menu.addAction(wiz_action)
-
-        file_menu = menubar.addMenu('Manual')
+        file_menu = menubar.addMenu('Convert')
 
         file_menu.addAction(set_action)
         file_menu.addAction(open_action)
@@ -190,27 +250,47 @@ class AppWindow(QMainWindow):
         split_menu = menubar.addMenu('Split')
 
         split_menu.addAction(split_action)
+        split_menu.addAction(split_all_action)
 
-
+        wizard_menu = menubar.addMenu('Wizard')
+        wizard_menu.addAction(wiz_action)
 
         # Layouts
         main_layout = QVBoxLayout(c_widget)
 
         self.editor = QTextEdit()
         main_layout.addWidget(self.editor)
-        self.editor.append("Welcome to <b>EcoG's Codec Converter!</b><br>"
-                           "Please <b>set codecs</b> and <b>choose directory</b> to proceed.")
+        self.editor.append(
+            "Welcome to <b>EcoG's Codec Converter and Cue Splitter!</b><br>"
+            "if you want to Convert please <b>set codecs</b> and "
+            "<b>choose directory</b> to proceed.<br>or choose a <b>cue</b> file "
+            "(or a directory with many cue files) to <b>split</b>.<br>")
 
         # Set central widget
         self.setCentralWidget(c_widget)
 
         # Connections
+        sys.stdout = EmittingStream()
+        sys.stdout.text_written.connect(self.normal_output_written)
         quit_action.triggered.connect(self.close)
         self.worker_messages.connect(self.editor_update)
 
         # Wizard
         if self.settings.get('show_welcome', True):
             self.start_wizard()
+
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        sys.stdout = sys.__stdout__
+        event.accept()
+
+    def normal_output_written(self, text):
+       #  self.editor.append(text)
+        cursor = self.editor.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertText(text)
+        self.editor.setTextCursor(cursor)
+        self.editor.ensureCursorVisible()
 
 
     def save_json(self, path: Path, obj):
@@ -232,7 +312,8 @@ class AppWindow(QMainWindow):
     def editor_update(self, msg):
         self.editor.append(msg)
 
-    def file_converter(self, from_codec: str, to_codec: str, convert_dir: str, del_files=False):
+    def file_converter(self, from_codec: str, to_codec: str, convert_dir: str,
+                       del_files=False):
         # convert_dir = "/path/to/folder/tobeconverted"
         f_codec = "." + from_codec
         t_codec = "." + to_codec
@@ -246,14 +327,16 @@ class AppWindow(QMainWindow):
                     output = file.replace(f_codec, t_codec)
                     try:
                         (ffmpeg.input(file).output(output).run())
-                        """(ffmpeg.input(file, hwaccel='qsv',vcodec='h264_qsv')        #This tells FFmpeg to use Intel Arc's hardware decoder for AVC.
-                                  .output(output,
-                                                vcodec='hevc_qsv',
-                                                global_quality=22,     # quality (like CRF for QSV 18 to 26)
-                                                video_bitrate='10M',   # optional:
-                                                maxrate='10M',         # optional:
-                                                bufsize='20M',         # optional:
-                                                preset='slow').run())  # optional: 'medium', 'fast', 'faster', etc."""
+# TODO: Use hardware acceleration for video if available
+#(ffmpeg.input(file, hwaccel='qsv',vcodec='h264_qsv')
+# #This tells FFmpeg to use Intel Arc's hardware decoder for AVC.
+#           .output(output,
+#           vcodec='hevc_qsv',
+#                      global_quality=22,     # quality (like CRF for QSV 18 to 26)
+#           video_bitrate='10M',   # optional:
+#           maxrate='10M',         # optional:
+#           bufsize='20M',         # optional:
+#           preset='slow').run())  # optional: 'medium', 'fast', 'faster', etc.
                         self.worker_messages.emit(f"File {output} created.")
                     except FileNotFoundError as e:
                         self.work_error.emit("File not found. " + str(e))
@@ -280,16 +363,19 @@ class AppWindow(QMainWindow):
             self.valid_muxers_lower = {item.lower() for item in
                                          all_codecs}
             self.c_from, self.c_to, self.del_files = from_to_input.get_inputs()
-            if self.c_from.lower() in self.valid_demuxers_lower and self.c_to.lower() in self.valid_muxers_lower:
+            if (self.c_from.lower() in self.valid_demuxers_lower and
+                    self.c_to.lower() in self.valid_muxers_lower):
                 if self.del_files:
                     no = ''
                 else:
                     no = 'NOT'
                 self.editor.append(
                     f"You chose to convert from: <b>{self.c_from}</b>, "
-                    f"to: <b>{self.c_to}</b> and {no} delete the {self.c_from} files.")
-                if selected_directory:
-                    self.editor.append(f"You selected the directory: {selected_directory}"
+                    f"to: <b>{self.c_to}</b> and {no} delete the {self.c_from} "
+                    f"files.")
+                if self.selected_directory:
+                    self.editor.append(f"You selected the directory: "
+                                       f"{selected_directory}"
                         f"\nNow hit [ Go ] to start the convertion!")
                 else:
                     self.editor.append("Please select <b>directory</b> to proceed.")
@@ -306,11 +392,59 @@ class AppWindow(QMainWindow):
             # exec() returns QDialog.Rejected (0) if Cancel was clicked
             self.editor.append("User cancelled the dialog.")
 
+
+
     def split(self):
-        cue_file = QFileDialog.getOpenFileNames(self, "Select a cue file to split",
-                                            "",
-                                            "Cue files (*.cue)")[0][0]
-        cue_spliter(cue_file)
+        cue_file = None
+        file_dialog = QFileDialog(self, caption="Select a cue file to split",
+                                  filter="Cue files (*.cue)")
+        file_dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        file_dialog.setViewMode(QFileDialog.ViewMode.List)
+        if file_dialog.exec():
+            cue_file = file_dialog.selectedFiles()[0]
+            self.editor.append(f"Selected cue file: {cue_file}")
+        else:
+            self.editor.append("You cancelled the cue file selection.")
+            return
+        delete_original = QMessageBox.question(self, 'Delete Original?',
+       "Do you want to delete the original audio file after splitting?",
+                            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if delete_original == QMessageBox.Yes:
+            run_mode = True
+        elif delete_original == QMessageBox.No:
+            run_mode = False
+        else:
+            self.editor.append("You cancelled the cue file selection.")
+            return
+        cue_spliter(cue_file, run_mode)
+        self.editor.append(f"Processing cue file: {cue_file}")
+        if delete_original == QMessageBox.Yes:
+            remove_original_audio_file(cue_file)
+
+    def split_all(self):
+        selected_directory = select_directory_dialog()
+        if selected_directory is None:
+            self.editor.append("You cancelled the cue file selection.")
+            return
+        delete_original = QMessageBox.question(self,
+           'Delete Original?',
+           "Do you want to delete the original audio file after splitting?",
+           QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if delete_original == QMessageBox.Yes:
+            run_mode = True
+        elif delete_original == QMessageBox.No:
+            run_mode = False
+        else:
+            self.editor.append("You cancelled the cue file selection.")
+            return
+        for root, dirs, files in os.walk(selected_directory):
+            for name in files:
+                if name.endswith('.cue'):
+                    cue_file = os.path.join(root, name)
+                    audio_file = get_original_audio_file(cue_file)
+                    if audio_file and os.path.getsize(audio_file) >> 20 > 150:
+                        cue_spliter(cue_file, run_mode)
+        self.editor.append("All cue files processed.")
 
     def start_wizard(self):
         wizard = ConvertWizard(self)
@@ -323,8 +457,6 @@ class AppWindow(QMainWindow):
             self.c_to = wizard.field('to')
             self.del_files = wizard.field("delete_files")
             self.ready()
-          #  del_files = wizard.field("delete_files")
-           # self.go(wizard.field('from'), wizard.field('to'), del_files)
 
 
     def ready(self):
@@ -363,7 +495,7 @@ class AppWindow(QMainWindow):
             self.editor.clear()
             self.editor.append("Convertion Begins...")
             self.worker = LocalMetaWorker(c_from, c_to,
-                                self.selected_directory, del_files, self.file_converter)
+                    self.selected_directory, del_files, self.file_converter)
             self.worker.work_completed.connect(self.on_work_completed)
             self.worker.work_error.connect(self.on_work_error)
             self.worker.finished.connect(self.cleanup_worker)
@@ -395,7 +527,6 @@ class AppWindow(QMainWindow):
             self.worker = None
 
 
-
 class LocalMetaWorker(QThread):
     """
     Runs local audio metadata extraction off the GUI thread.
@@ -405,7 +536,8 @@ class LocalMetaWorker(QThread):
     work_completed = Signal(str)   # Emits {'retrieved_metadata': metadata}
     work_error = Signal(str)
 
-    def __init__(self, c_from, c_to, selected_directory, del_files, worker_callable):
+    def __init__(self, c_from, c_to, selected_directory, del_files,
+                 worker_callable):
         super().__init__()
         self.c_from = c_from
         self.c_to = c_to
@@ -418,7 +550,8 @@ class LocalMetaWorker(QThread):
         try:
             # Call the provided extractor (this will perform heavy work)
             self.callable(self.c_from, self.c_to,
-                                               self.selected_directory, self.del_files)
+                                               self.selected_directory,
+                          self.del_files)
             # Emit in same structure as your remote meta worker
             self.work_completed.emit("Convertion Completed!")
         except Exception as e:
@@ -499,7 +632,8 @@ class CodecsWizardPage(QWizardPage):
                 "Status: **One or both formats are invalid** ❌")
             self.status_label.setStyleSheet("color: red; font-weight: bold;")
 
-        # Call completeChanged() to notify the QWizard if the validation status has changed
+        # Call completeChanged() to notify the QWizard if the validation status
+        # has changed
         self.completeChanged.emit()
 
     def isComplete(self):
@@ -542,7 +676,8 @@ class ConvertWizard(QWizard):
         page = QWizardPage()
         page.setTitle("Welcome to EcoG's Codec Converter!")
         label = QLabel(
-            "This wizard will help you to convert your files from one codec to another.")
+            "This wizard will help you to convert your files from one codec to "
+            "another.")
         label.setWordWrap(True)
         layout = QVBoxLayout()
         layout.addWidget(label)
@@ -558,7 +693,8 @@ class ConvertWizard(QWizard):
         def select_directory():
             select_directory_dialog()
             label.setText(f"You selected: {selected_directory}\nNow hit [ Finish ] "
-                          f"to start the convertion, or [ Browse ] to select another directory.")
+                          f"to start the convertion, or [ Browse ] to select "
+                          f"another directory.")
 
 
         page = QWizardPage()
@@ -613,15 +749,3 @@ if __name__ == '__main__':
     window = AppWindow(settings)
     window.show()
     sys.exit(app.exec())
-
-
-'''if __name__ == "__main__":
-    # Example usage:
-    cue_file_path = "example.cue"
-    output_directory = "output"
-    dry_run_mode = True
-
-    cue_spliter(cue_file_path, output_directory, dry_run_mode)
-
-    convert_directory = "to_be_converted"
-    ape_to_flac_converter(convert_directory)'''
